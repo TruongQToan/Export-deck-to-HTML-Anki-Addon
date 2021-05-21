@@ -6,6 +6,7 @@ from pickle import load, dump
 import os
 import re
 import sys
+import unicodedata
 
 html_template = """
     <!DOCTYPE html>
@@ -33,6 +34,8 @@ class AddonDialog(QDialog):
         self.deck = None
         self.fields = {}
         self.config_file = "export_decks_to_html_config.config"
+        self.card_orders = ["Default", "Oldest to newest", "Newest to oldest"]
+        self.order_fn = None
         if os.path.exists(self.config_file):
             try:
                 self.config = load(open(self.config_file, 'rb'))
@@ -56,8 +59,8 @@ class AddonDialog(QDialog):
         layout.setSpacing(10)
 
         deck_label = QLabel("Choose deck")
-        self.labels = []
 
+        ## deck name
         self.deck_selection = QComboBox()
         deck_names = sorted(mw.col.decks.allNames())
         current_deck = mw.col.decks.current()['name']
@@ -71,19 +74,35 @@ class AddonDialog(QDialog):
         layout.addWidget(deck_label, 1, 0, 1, 1)
         layout.addWidget(self.deck_selection, 1, 1, 1, 2)
 
+        ## order
+        order_label = QLabel("Order by")
+        self.order_selection = QComboBox()
+        orders = self.card_orders[:]
+        currentOrder = self.config.get("order_selection", "")
+        if len(currentOrder) > 0:
+            orders.remove(currentOrder)
+            orders.insert(0, currentOrder)
+
+        self.order_selection.addItems(orders)
+        self.order_selection.currentIndexChanged.connect(self._order_card)
+        layout.addWidget(order_label, 2, 0, 1, 1)
+        layout.addWidget(self.order_selection, 2, 1, 1, 2)
+
+        ## css section
         css_label = QLabel('CSS')
         self.css_tb = QTextEdit(self)
         self.css_tb.resize(380,60)
         self.css_tb.setPlainText(self._setup_css())
-        layout.addWidget(css_label, 2, 0, 1, 1)
-        layout.addWidget(self.css_tb, 2, 1, 1, 2)
+        layout.addWidget(css_label, 3, 0, 1, 1)
+        layout.addWidget(self.css_tb, 3, 1, 1, 2)
 
+        ## html template
         html_label = QLabel('HTML')
         self.html_tb = QTextEdit(self)
         self.html_tb.resize(380,60)
         self.html_tb.setPlainText(self._setup_html())
-        layout.addWidget(html_label, 3, 0, 1, 1)
-        layout.addWidget(self.html_tb, 3, 1, 1, 2)
+        layout.addWidget(html_label, 4, 0, 1, 1)
+        layout.addWidget(self.html_tb, 4, 1, 1, 2)
 
         # Main button box
         ok_btn = QPushButton("Export")
@@ -138,6 +157,7 @@ class AddonDialog(QDialog):
         self.config[self.deck_selection.currentText()] = {}
         self.config[self.deck_selection.currentText()]['html_text'] = self.html_tb.toPlainText()
         self.config[self.deck_selection.currentText()]['css_text'] = self.css_tb.toPlainText()
+        self.config["order_selection"] = self.order_selection.currentText()
         dump(self.config, open(self.config_file, 'wb'))
         utils.showInfo("Config saved")
 
@@ -164,16 +184,67 @@ class AddonDialog(QDialog):
         note = card.note()
         model = note.model()
         fields = card.note().keys()
-        return fields 
+        return fields
+
+
+    def _order_card(self):
+        def oldestToNewest(cards):
+            return sorted(cards, key=lambda card: card.nid)
+
+        def newestToOldest(cards):
+            return sorted(cards, key=lambda card: card.nid, reverse=True)
+
+        order_by = self.order_selection.currentText()
+        ## default
+        if order_by == self.card_orders[0]:
+            self.order_fn = None
+            return
+
+        ## oldest to newest
+        if order_by == self.card_orders[1]:
+            self.order_fn = oldestToNewest
+
+        ## newest to oldest
+        if order_by == self.card_orders[2]:
+            self.order_fn = newestToOldest
+
+
+    def _get_all_cards(self, deck_name):
+        deck_name = deck_name.replace('"', '')
+        deck_name = unicodedata.normalize('NFC', deck_name)
+        deck = mw.col.decks.byName(deck_name)
+        if deck == None:
+            utils.showInfo("Deck {} does not exist.".format(deck_name))
+
+        decks = [deck_name,]
+        if len(mw.col.decks.children(deck['id'])) != 0:
+            decks = [name for (name, _) in mw.col.decks.children(deck['id'])]
+
+        decks = sorted(decks)
+        deck_audios = []
+        allCards = []
+        for deck in decks:
+            query = 'deck:"{}"'.format(deck)
+            cids = mw.col.findCards(query=query)
+            cards = []
+            for cid in cids:
+                cards.append(mw.col.getCard(cid))
+
+            if self.order_fn is not None:
+                cards = self.order_fn(cards)
+            
+            allCards.extend(cards)
+        
+        return allCards
+
 
     def _on_accept(self):
         dialog = SaveFileDialog(self.deck_selection.currentText())
         path = dialog.filename
         if path == None:
             return
-        deck = self.deck_selection.currentText()
-        query = 'deck:"{}"'.format(deck)
-        cids = mw.col.findCards(query=query)
+
+        cards = self._get_all_cards(self.deck_selection.currentText())
         collection_path = mw.col.media.dir()
         if sys.version_info[0] >= 3:
             path = path[0]
@@ -182,41 +253,23 @@ class AddonDialog(QDialog):
                 html = ""
                 template = self.html_tb.toPlainText()
                 fields = re.findall("\{\{.*\}\}", template)
-                for i, cid in enumerate(cids):
+                for i, card in enumerate(cards):
                     card_html = template
                     card_html = card_html.replace("{{id}}", str(i + 1))
-                    card = mw.col.getCard(cid)
                     for fi, field in enumerate(fields):
-                        anyFieldFound = False #to check if any field matched, otherwise show error message in exported file.
                         if field == "{{id}}":
                             continue
-                        fieldNames = field[2:-2].split("//") #for decks that has multiple card types, e.g use {{Front//Text}} or {{Back//Extra}}
-                        for fieldName in fieldNames:
-                            try:
-                                value = card.note()[fieldName]
-                                value = re.sub(r'{{[c|C][0-9]+::(.*?)}}',r'\g<1>',value) # get rid of the cloze deletion formatting e.g. {{c1::someText}}
-                                anyFieldFound = True
-                                break
-                            except:
-                                continue
-                        pictures = re.findall(r'src=["|' + "']" + "(.*?)['|" + '"]', value) #to find src='()' or src="()"
-                        img_tmp01 = 'src="%s"'
-                        img_tmp02 = "src='%s'"
+                        value = card.note()[field[2:-2]]
+                        pictures = re.findall(r'\<img src="(.*?)"', value)
+                        img_tmp = '<img src="file://%s">'
                         if len(pictures):
+                            ## value = ""
                             for pic in pictures:
                                 full_img_path = os.path.join(collection_path, pic)
-                                value = value.replace(img_tmp01 % pic, img_tmp01 % full_img_path)
-                                value = value.replace(img_tmp02 % pic, img_tmp02 % full_img_path)
+                                img_tag = img_tmp % full_img_path
+                                value = value.replace(pic,"file://"+full_img_path)
                         card_html = card_html.replace("%s" % field, value)
-                        value = ''
-                    if anyFieldFound:
-                        html += card_html
-                    else:
-                        html += '**************************************************************<br>\n'
-                        html += 'Card Index:' + str(i + 1) + '<br>\n'
-                        html += 'Card type not supported;<br>\n'
-                        html += 'Edit the HTML Template to support these fields: ("' + '-'.join(card.note().keys()) + '").<br>\n'
-                        html += '**************************************************************<br>\n'
+                    html += card_html
 
                 output_html = html_template.replace("{{style}}", self.css_tb.toPlainText())
                 output_html = output_html.replace("{{body}}", html)
